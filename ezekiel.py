@@ -3,7 +3,7 @@ import sys
 import random
 import collections
 from collections import deque
-from tetris_agent import TetrisAgent  # Import the agent and neural network
+from tetris_agent import TetrisAgent, TetrisCNN  # Import the agent and neural network
 import torch.optim as optim
 import torch.nn as nn
 import torch
@@ -18,6 +18,8 @@ import pickle
 import copy
 import logging
 import traceback
+import glob
+import matplotlib.pyplot as plt
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
@@ -93,238 +95,8 @@ def construct_state_tensor(grid, score, lines_cleared, pieces_placed, level, dev
     combined_input = torch.cat((grid_tensor, metrics_expanded), dim=0)  # Shape: (5, 20, 10)
 
     return combined_input
-
-def inspect_bfs_data_details(bfs_data, sample_size=5):
-    print(f"\n--- Inspecting First {sample_size} BFS Records ---")
-    for idx, sample in enumerate(bfs_data[:sample_size]):
-        if len(sample) != 8:
-            print(f"Record {idx}: Invalid length {len(sample)}. Expected 8 elements.")
-            print(f"  Sample Content: {sample}")
-            logging.warning(f"Record {idx}: Invalid length {len(sample)}. Expected 8 elements.")
-            continue
-        try:
-            input_grid, best_path, final_x, final_rot, score, lines_cleared, pieces_placed, level = sample
-        except ValueError as e:
-            print(f"Record {idx}: Error unpacking sample - {e}")
-            print(f"  Sample Content: {sample}")
-            logging.error(f"Record {idx}: Error unpacking sample - {e}")
-            continue
-
-        # Check if final_rot is defined and valid
-        if final_rot is None:
-            print(f"Record {idx}: final_rot is None.")
-            logging.warning(f"Record {idx}: final_rot is None.")
-            continue
-
-        print(f"Record {idx}:")
-        print(f"  Input Grid Length: {len(input_grid)}")
-        print(f"  Best Path: {best_path}")
-        print(f"  Final X: {final_x}")
-        print(f"  Final Rotation: {final_rot}")
-        print(f"  Score: {score}")
-        print(f"  Lines Cleared: {lines_cleared}")
-        print(f"  Pieces Placed: {pieces_placed}")
-        print(f"  Level: {level}\n")
-
-        if isinstance(best_path, list):
-            print(f"  Best Path Type: List with {len(best_path)} tokens")
-        elif isinstance(best_path, str):
-            print(f"  Best Path Type: String - {best_path}")
-        else:
-            print(f"  Best Path Type: {type(best_path)}")
-
-        print("-" * 50)
-
-def inspect_bfs_tokens(bfs_data, sample_size=100):
-    """
-    Inspects and prints unique action tokens in the BFS data.
-    """
-    unique_tokens = set()
-    for idx, sample in enumerate(bfs_data[:sample_size]):
-        if len(sample) != 8:
-            continue  # Skip invalid records
-        _, best_path, _, _, _, _, _, _ = sample
         
-        if isinstance(best_path, list):
-            tokens = best_path
-        elif isinstance(best_path, str):
-            tokens = best_path.split()
-        else:
-            logging.warning(f"Record {idx}: best_path is neither list nor string.")
-            continue
-        
-        for token in tokens:
-            normalized_token = token.upper().strip()
-            unique_tokens.add(normalized_token)
-    
-    print(f"Unique action tokens in BFS data (first {sample_size} records): {unique_tokens}")
-    logging.info(f"Unique action tokens in BFS data (first {sample_size} records): {unique_tokens}")
-
-def supervised_train_from_bfs(
-    agent, 
-    bfs_data_path="training_data.pkl", 
-    epochs=5, 
-    batch_size=32
-):
-    """
-    Loads BFS data and trains the agent's model via supervised learning.
-    """
-    # --- Load BFS Data ---
-    try:
-        with open(bfs_data_path, 'rb') as f:
-            bfs_data = pickle.load(f)
-        print(f"Successfully loaded BFS data. Records: {len(bfs_data)}")
-        logging.info(f"Successfully loaded BFS data. Records: {len(bfs_data)}")
-    except Exception as e:
-        print(f"Failed to load BFS data from {bfs_data_path}: {e}")
-        logging.error(f"Failed to load BFS data from {bfs_data_path}: {e}")
-        return
-
-    # --- Inspect Action Tokens ---
-    inspect_bfs_tokens(bfs_data, sample_size=100)  # Inspect first 100 records
-    device = agent.device
-    action_size = agent.action_size
-
-    X_list = []
-    y_list = []
-
-    # --- Build training pairs (state -> action) from BFS data ---
-    for idx, sample in enumerate(bfs_data):
-        # Each sample must match the structure: (input_grid, best_path, final_x, final_rot, score, lines_cleared, pieces_placed, level)
-        if len(sample) != 8:
-            print(f"Record {idx} missing elements (expected 8). Skipping.")
-            logging.warning(f"Record {idx} missing elements (expected 8). Skipping.")
-            continue
-
-        input_grid, best_path, final_x, final_rot, score, lines_cleared, pieces_placed, level = sample
-
-        # Convert the flattened grid to a 1-channel tensor of shape (1,1,20,10)
-        try:
-            arr = np.array(input_grid, dtype=np.float32).reshape((1, 1, 20, 10))
-            grid_tensor = torch.tensor(arr, device=device)  # shape: (1,1,20,10)
-        except Exception as e:
-            print(f"Record {idx}: Error reshaping input_grid: {e}. Skipping.")
-            logging.error(f"Record {idx}: Error reshaping input_grid: {e}. Skipping.")
-            continue
-
-        # Scale game metrics and expand them into 4 additional channels
-        scaled_metrics = scale_metrics(score, lines_cleared, pieces_placed, level)
-        metrics_tensor = torch.tensor(scaled_metrics, dtype=torch.float32, device=device)  # shape: (4,)
-        metrics_expanded = metrics_tensor.view(1, -1, 1, 1).expand(1, 4, 20, 10)           # shape: (1,4,20,10)
-
-        # Combine grid + metrics into a single 5-channel tensor: (1,5,20,10)
-        try:
-            combined_input = torch.cat((grid_tensor, metrics_expanded), dim=1)
-        except Exception as e:
-            print(f"Record {idx}: Error concatenating metrics: {e}. Skipping.")
-            logging.error(f"Record {idx}: Error concatenating metrics: {e}. Skipping.")
-            continue
-
-        # For each action token in the BFS path, create a separate (state, action) example
-        for token in best_path:
-            normalized_token = token.upper()
-            if normalized_token not in BFS_ACTION_MAP:
-                print(f"Record {idx}: Unknown BFS token '{token}'. Skipping this action.")
-                logging.warning(f"Record {idx}: Unknown BFS token '{token}'. Skipping this action.")
-                continue
-            action_idx = BFS_ACTION_MAP[normalized_token]
-            if action_idx >= action_size:
-                print(f"Record {idx}: Action index {action_idx} out of range. Skipping.")
-                logging.warning(f"Record {idx}: Action index {action_idx} out of range. Skipping.")
-                continue
-            X_list.append(combined_input)
-            y_list.append(action_idx)
-            logging.debug(f"Record {idx}: Mapped token '{token}' to action {action_idx}")
-
-    # --- Inspect Action Tokens ---
-    inspect_bfs_tokens(bfs_data, sample_size=100)  # Inspect first 100 records
-
-    # Log first few best_paths
-    inspect_bfs_data_details(bfs_data, sample_size=5)
-    if not X_list:
-        print("No valid BFS records found. Supervised training aborted.")
-        logging.error("No valid BFS records found. Supervised training aborted.")
-        return
-    else:
-        print(f"Valid BFS records for training: {len(X_list)}")
-        logging.info(f"Valid BFS records for training: {len(X_list)}")
-
-    # --- Convert to tensors for training ---
-    try:
-        X = torch.cat(X_list, dim=0)  # shape: (N,5,20,10)
-        y = torch.tensor(y_list, dtype=torch.long, device=device)  # shape: (N,)
-        print(f"Prepared BFS training data. X shape: {X.shape}, y shape: {y.shape}")
-        logging.info(f"Prepared BFS training data. X shape: {X.shape}, y shape: {y.shape}")
-    except Exception as e:
-        print(f"Error creating training tensors: {e}")
-        logging.error(f"Error creating training tensors: {e}")
-        return
-
-    # --- Define a simple training loop (CrossEntropy) ---
-    model = agent.gpu_model
-    model.train()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    
-    dataset_size = len(X)
-    num_batches = (dataset_size + batch_size - 1) // batch_size
-    print(f"Supervised training: {epochs} epochs, ~{num_batches} batches/epoch")
-    logging.info(f"Supervised training: {epochs} epochs, ~{num_batches} batches/epoch")
-
-    for epoch in range(epochs):
-        permutation = torch.randperm(dataset_size)
-        epoch_loss = 0.0
-
-        for b_idx in range(num_batches):
-            start_idx = b_idx * batch_size
-            end_idx = min(start_idx + batch_size, dataset_size)
-            indices = permutation[start_idx:end_idx]
-
-            batch_X = X[indices]    # shape: (B,5,20,10)
-            batch_y = y[indices]    # shape: (B,)
-
-            optimizer.zero_grad()
-            outputs = model(batch_X)  # shape: (B, action_size)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-
-        avg_loss = epoch_loss / num_batches
-        print(f"Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.4f}")
-        logging.info(f"Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.4f}")
-
-    print("BFS supervised training complete.\n")
-    logging.info("BFS supervised training complete.")
-
-    # --- Save the trained model ---
-    model_save_path = "trained_bfs_model.pth"
-    agent.save_model(model_save_path)
-    print(f"Model parameters saved to {model_save_path}")
-    logging.info(f"Model parameters saved to {model_save_path}")
-
-# -------------------- END SUPERVISED BFS TRAINING CHANGES --------------------
-
-def save_training_data(data, file_path="training_data.pkl"):
-    """
-    Saves the training data to a pickle file.
-
-    Parameters:
-    - data (list): List of training samples.
-    - file_path (str): Path to the pickle file.
-    """
-    try:
-        with open(file_path, "wb") as f:
-            pickle.dump(data, f)
-        logging.info(f"Training data saved to {file_path}. Total samples: {len(data)}")
-    except Exception as e:
-        logging.error(f"Failed to save training data to {file_path}: {e}")
-
 def extract_path(base_save_path):
-    if isinstance(base_save_path, dict):
-        # Get the actual path from DictProxy
-        return base_save_path.get('path', None)
     return base_save_path
 
 def save_training_state(agent, optimizer, generation, base_save_path, save_lock=None, force_save=False):
@@ -388,81 +160,14 @@ def save_training_state(agent, optimizer, generation, base_save_path, save_lock=
         if os.path.exists(temp_save_path):
             os.remove(temp_save_path)
 
-def load_training_state(agent, base_save_path, optimizer, max_retries=5, retry_delay=1.0):
-    base_save_path = extract_path(base_save_path)  # Ensure it's a string path
-    print(f"[DEBUG] Attempting to load checkpoint from: {base_save_path}")
-    logging.debug(f"Attempting to load checkpoint from: {base_save_path}")
-
-    for attempt in range(max_retries):
-        try:
-            if os.path.exists(base_save_path):
-                checkpoint = torch.load(base_save_path)
-                print(f"[DEBUG] Loaded checkpoint with keys: {checkpoint.keys()} from {base_save_path}")
-                logging.debug(f"Loaded checkpoint with keys: {checkpoint.keys()} from {base_save_path}")
-
-                # Ensure the checkpoint contains all required keys
-                if all(key in checkpoint for key in ['model_state_dict', 'optimizer_state_dict', 'generation', 'memory']):
-                    # **Convert dict transitions to tuples if necessary**
-                    if len(checkpoint['memory']) > 0 and isinstance(checkpoint['memory'][0], dict):
-                        logging.info("Converting memory transitions from dicts to tuples.")
-                        print("[DEBUG] Converting memory transitions from dicts to tuples.")
-                        converted_memory = []
-                        for transition in checkpoint['memory']:
-                            if isinstance(transition, dict):
-                                try:
-                                    converted_transition = (
-                                        transition['state'],
-                                        transition['action'],
-                                        transition['reward'],
-                                        transition['next_state'],
-                                        transition['done']
-                                    )
-                                    converted_memory.append(converted_transition)
-                                except KeyError as e:
-                                    logging.error(f"Missing key in transition during conversion: {e}")
-                                    print(f"[DEBUG] Missing key in transition during conversion: {e}")
-                            elif isinstance(transition, tuple):
-                                # Additional type checks for tuple elements
-                                if len(transition) != 5:
-                                    logging.error(f"Transition tuple length mismatch: {len(transition)}")
-                                    print(f"[DEBUG] Transition tuple length mismatch: {len(transition)}")
-                                    continue
-                                state, action, reward, next_state, done = transition
-                                if not (isinstance(state, torch.Tensor) and isinstance(action, int) and 
-                                        (isinstance(reward, float) or isinstance(reward, int)) and 
-                                        isinstance(next_state, torch.Tensor) and isinstance(done, bool)):
-                                    logging.error(f"Transition tuple has incorrect types: {transition}")
-                                    print(f"[DEBUG] Transition tuple has incorrect types: {transition}")
-                                    continue
-                                converted_memory.append(transition)
-                            else:
-                                logging.error(f"Unknown transition type: {type(transition)}. Skipping.")
-                                print(f"[DEBUG] Unknown transition type: {type(transition)}. Skipping.")
-                        checkpoint['memory'] = converted_memory
-                        logging.info("Conversion of memory transitions complete.")
-                        print("[DEBUG] Conversion of memory transitions complete.")
-                    
-                    agent.gpu_model.load_state_dict(checkpoint['model_state_dict'])
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    agent.memory = deque(checkpoint['memory'], maxlen=2000)  # Load the memory buffer
-                    print(f"[DEBUG] Loaded training state from generation {checkpoint['generation']} from {base_save_path}")
-                    logging.info(f"Loaded training state from generation {checkpoint['generation']} from {base_save_path}")
-                    return checkpoint['generation']
-                else:
-                    print(f"[DEBUG] Checkpoint {base_save_path} is missing required keys: {checkpoint.keys()}")
-                    logging.warning(f"Checkpoint {base_save_path} is missing required keys: {checkpoint.keys()}")
-                    return 0
-            else:
-                print(f"[DEBUG] No checkpoint found at {base_save_path}. Starting from scratch.")
-                logging.info(f"No checkpoint found at {base_save_path}. Starting from scratch.")
-                return 0
-        except Exception as e:
-            print(f"[DEBUG] Error loading checkpoint: {e}. Retrying in {retry_delay} seconds...")
-            logging.error(f"Error loading checkpoint: {e}. Retrying in {retry_delay} seconds...", exc_info=True)
-            time.sleep(retry_delay)
+def load_training_state(agent, checkpoint_path):
+    generation = agent.load_model(checkpoint_path, agent.device)
+    if generation > 0:
+        logging.info(f"Successfully loaded training state from generation {generation}.")
+    else:
+        logging.info("Starting training from scratch.")
+    return generation
     
-    raise RuntimeError(f"[DEBUG] Failed to load training state after {max_retries} attempts.")
-
 def get_state_feature_vector(state, device):
     try:
         grid = np.array(state['board'])  
@@ -516,11 +221,11 @@ def get_game_state(grid):
     return state
 
 BFS_WEIGHTS = {
-    'complete_lines': 300,
-    'aggregate_height': -30,
-    'holes': -100,
-    'bumpiness': -15,
-    'flat_bonus': 5
+    'complete_lines': 300,      # Positive reward for lines cleared
+    'aggregate_height': -40,    # Negative reward for higher aggregate height
+    'holes': -150,              # Negative reward for holes
+    'bumpiness': -15,           # Negative reward for bumpiness
+    'flat_bonus': 10            # Positive reward for flatness
 }
 
 def get_center_penalty(x):
@@ -529,6 +234,15 @@ def get_center_penalty(x):
     distance_from_center = abs(x - center)
     penalty = distance_from_center * 2  # Adjust multiplier as needed
     return penalty
+
+def get_height_bonus(tetrimino_shape, y):
+    """Calculate bonus based on how low the piece is placed."""
+    piece_height = len(tetrimino_shape)
+    piece_bottom_y = y + piece_height
+    height_from_bottom = (GRID_HEIGHT - piece_bottom_y) / GRID_HEIGHT
+    height_bonus = (1 - height_from_bottom) * 2000
+    print(f"Height bonus: {height_bonus} for y={y}, bottom_y={piece_bottom_y}")
+    return height_bonus
 
 def get_reward_and_next_state(
     agent,
@@ -548,111 +262,300 @@ def get_reward_and_next_state(
     level=1,
     device=None
 ):
-    """
-    Enhanced Tetris reward function aligned with BFS heuristic and improved for better performance.
-    """
-    # Initialize reward
-    reward = -1  # Step penalty
-
-    # 1) LINE CLEAR REWARD
-    line_clear_reward_map = {1: 1000, 2: 3000, 3: 7000, 4: 14000}
-    line_clear_points = line_clear_reward_map.get(lines_cleared, 0)
-    reward += line_clear_points
-
-    if lines_cleared > 0:
-        print(f"[DEBUG] Lines cleared: {lines_cleared} -> +{line_clear_points}")
-
-    # 2) ROTATION PENALTY
+    reward = 0
+    
     if rotations > 3:
-        rotation_penalty = (rotations - 3) * 5
-        reward -= rotation_penalty
-        print(f"[DEBUG] Rotation penalty => -{rotation_penalty}")
-
-    # After state updates
-    after_holes = count_holes(grid)
-    after_max_height, after_col_heights = get_max_height_and_column_heights(grid)
-    after_bumpiness = get_bumpiness(after_col_heights)
+        penalty = (rotations - 3) * 1000
+        reward -= penalty
+        #print(f"[DEBUG] Rotation penalty => -{penalty}")
+        
+    # Small penalty each time we move or rotate
+    if moved_horizontally or moved_down or locked or rotations > 0:
+        reward -= 0.1
 
     if locked:
-        # Before locking, remove the locked piece to measure before state
-        grid_without = [row[:] for row in grid]
-        for i, row_block in enumerate(tetrimino_shape):
-            for j, block in enumerate(row_block):
-                if block and 0 <= (y + i) < GRID_HEIGHT and 0 <= (x + j) < GRID_WIDTH:
-                    grid_without[y + i][x + j] = 0
+        # -----------------------------------------------------------
+        # 1) Make a copy of the grid, remove the newly locked piece
+        #    so we don't incorrectly count holes "above" it.
+        # -----------------------------------------------------------
+        temp_grid = [row[:] for row in grid]
+        if tetrimino_shape:
+            for i, row_data in enumerate(tetrimino_shape):
+                for j, block in enumerate(row_data):
+                    if block:
+                        board_r = y + i
+                        board_c = x + j
+                        if 0 <= board_r < GRID_HEIGHT and 0 <= board_c < GRID_WIDTH:
+                            # Remove this piece block from the copy
+                            temp_grid[board_r][board_c] = 0
 
-        before_holes = count_holes(grid_without)
-        before_max_height, before_col_heights = get_max_height_and_column_heights(grid_without)
-        before_bumpiness = get_bumpiness(before_col_heights)
+        # -----------------------------------------------------------
+        # 2) Compute hole-related stats on the temp_grid (no piece)
+        # -----------------------------------------------------------
+        holes = count_holes(temp_grid)
+        before_max_height, before_aggregate_height, before_col_heights = get_max_height_and_aggregate_height(temp_grid)
+        bumpiness = get_bumpiness(before_col_heights)
 
-        # 3) APPLY BFS HEURISTIC WEIGHTS
-        reward += (
-            BFS_WEIGHTS['complete_lines'] * lines_cleared
-            + BFS_WEIGHTS['aggregate_height'] * after_max_height
-            + BFS_WEIGHTS['holes'] * after_holes
-            + BFS_WEIGHTS['bumpiness'] * after_bumpiness
-        )
+        # Height bonus for how low we placed the piece
+        height_bonus = get_height_bonus(tetrimino_shape, y)
+        reward += height_bonus
 
-        # 4) ADD FLATNESS BONUS
-        flat_bonus = (GRID_HEIGHT - after_max_height) * BFS_WEIGHTS['flat_bonus']
-        reward += flat_bonus
-        if flat_bonus > 0:
-            print(f"[DEBUG] Flatness bonus: +{flat_bonus}")
+        contact_points = count_contact_points(grid, tetrimino_shape, x, y)
+        side_touches = count_side_touches(grid, tetrimino_shape, x, y)
+        reward += contact_points * 50
+        reward += side_touches * 30
 
-        # 5) CENTRALIZATION PENALTY
-        central_penalty = 0
-        for row in grid:
-            for x_pos, cell in enumerate(row):
-                if cell != 0:
-                    central_penalty += get_center_penalty(x_pos)
-        reward -= central_penalty
-        if central_penalty > 0:
-            print(f"[DEBUG] Centralization penalty: -{central_penalty}")
+        if contact_points >= 3 and side_touches >= 2:
+            reward += 300
+        if contact_points == 0:
+            reward -= 100
 
-        # 6) HARSH PENALTY IF ANY COLUMN ABOVE 75%
-        if after_max_height >= 0.75 * GRID_HEIGHT:
-            reward -= 500
-            print("[DEBUG] Tall column penalty: -500")
+        # Edge tower detection logic on temp_grid
+        edge_height_threshold = int(GRID_HEIGHT * 0.75)
+        left_height, left_holes = analyze_edge_column(temp_grid, 0)
+        right_height, right_holes = analyze_edge_column(temp_grid, GRID_WIDTH - 1)
 
-        # 7) GAME OVER PENALTY
-        if game_over:
-            reward -= 3000  # even bigger than previous
-            print("[DEBUG] Game over penalty => -3000")
+        if left_height > edge_height_threshold:
+            height_penalty = ((left_height - edge_height_threshold) ** 2) * 100
+            hole_penalty = left_holes * left_height * 25
+            total_penalty = height_penalty + hole_penalty
+            reward -= total_penalty
 
-    # Build next state with 5 channels
+        if right_height > edge_height_threshold:
+            height_penalty = ((right_height - edge_height_threshold) ** 2) * 100
+            hole_penalty = right_holes * right_height * 25
+            total_penalty = height_penalty + hole_penalty
+            reward -= total_penalty
+
+        # Additional height penalty
+        height_penalty = 0
+        for col_height in before_col_heights:
+            if col_height > GRID_HEIGHT * 0.6:
+                height_penalty += (col_height - GRID_HEIGHT * 0.6) * 5
+            if col_height > GRID_HEIGHT * 0.8:
+                height_penalty += (col_height - GRID_HEIGHT * 0.8) * 10
+        reward -= height_penalty
+
+        # Penalties for holes and bumpiness
+        reward -= bumpiness * 10
+        reward -= holes * 100
+
+        print(f"Locked piece - Height bonus: {height_bonus}, Holes: {holes}, Bumpiness: {bumpiness}")
+
+    # Reward for lines cleared
+    if lines_cleared > 0:
+        line_rewards = {1: 1000, 2: 2500, 3: 5000, 4: 8000}
+        reward += line_rewards.get(lines_cleared, lines_cleared * 100)
+        # Bonus if our max height is still below half the board
+        if before_max_height < GRID_HEIGHT * 0.5:
+            reward += lines_cleared * 50
+
+    # Game over penalty
+    if game_over:
+        reward -= 500
+
+    # Construct next state
     next_state = construct_state_tensor(grid, score, lines_cleared, pieces_placed, level, device)
-
+    if locked:
+        print(f"Final reward: {reward}")
     return reward, next_state
+
+def get_height_bonus(tetrimino_shape, y):
+    """Calculate bonus based on how low the piece is placed."""
+    piece_height = len(tetrimino_shape)
+    piece_bottom_y = y + piece_height  # Get the bottom of the piece
+    height_from_bottom = (GRID_HEIGHT - piece_bottom_y) / GRID_HEIGHT
+    height_bonus = (1 - height_from_bottom) * 500  # Increased bonus for lower placement
+    print(f"Height bonus: {height_bonus} for y={y}, bottom_y={piece_bottom_y}")  # Debug print
+    return height_bonus
+    
+def analyze_edge_column(grid, col):
+    """Analyze a column for height and holes."""
+    first_block = None
+    holes = 0
+    
+    # Find first block from bottom
+    for row in range(GRID_HEIGHT - 1, -1, -1):
+        if grid[row][col] != 0:
+            first_block = row
+            break
+    
+    if first_block is None:
+        return 0, 0  # Empty column
+        
+    height = GRID_HEIGHT - first_block
+    
+    # Count holes (empty spaces below blocks)
+    has_block_above = False
+    for row in range(GRID_HEIGHT - 1, -1, -1):
+        if grid[row][col] != 0:
+            has_block_above = True
+        elif has_block_above:
+            holes += 1
+            
+    return height, holes
+
+def measure_edge_tower(col_heights, edge='left'):
+    """Measure the height of towers along the edges."""
+    if edge == 'left':
+        idx = 0
+    else:  # right
+        idx = len(col_heights) - 1
+        
+    # Get adjacent column height
+    adjacent_idx = 1 if edge == 'left' else len(col_heights) - 2
+    height_diff = col_heights[idx] - col_heights[adjacent_idx]
+    
+    # Only count as tower if significantly higher than adjacent column
+    return max(0, height_diff) if height_diff > 2 else 0
+
+def count_contact_points(grid, tetrimino_shape, x, y):
+    """Count number of bottom contact points for a piece."""
+    contacts = 0
+    for i, row in enumerate(tetrimino_shape):
+        for j, block in enumerate(row):
+            if block:
+                # Check if there's a block below or it's the bottom of the grid
+                if (y + i + 1 >= GRID_HEIGHT or 
+                    (y + i + 1 < GRID_HEIGHT and grid[y + i + 1][x + j] != 0)):
+                    contacts += 1
+    return contacts
+
+def count_side_touches(grid, tetrimino_shape, x, y):
+    """Count number of side contacts with existing pieces."""
+    touches = 0
+    for i, row in enumerate(tetrimino_shape):
+        for j, block in enumerate(row):
+            if block:
+                # Check left side
+                if x + j > 0 and grid[y + i][x + j - 1] != 0:
+                    touches += 1
+                # Check right side
+                if x + j < GRID_WIDTH - 1 and grid[y + i][x + j + 1] != 0:
+                    touches += 1
+    return touches
 
 # -------------- Helper Functions ---------------
 
-def count_holes(board):
-    """Count the number of holes in the board."""
+def print_grid(grid):
+    print("\n--- Current Grid State ---")
+    for row in grid:
+        print(' '.join(str(cell) for cell in row))
+    print("---------------------------\n")
+
+def count_holes(board, shape=None, x=0, y=0):
+    """
+    Remove the current piece from the board copy, then count holes.
+    """
+    temp_board = [row[:] for row in board]  # make copy
+    
+    # Remove the current piece’s blocks from temp_board
+    if shape is not None:
+        for i, row_data in enumerate(shape):
+            for j, block in enumerate(row_data):
+                if block:
+                    # Check boundaries, then remove
+                    br = y + i
+                    bc = x + j
+                    if 0 <= br < GRID_HEIGHT and 0 <= bc < GRID_WIDTH:
+                        temp_board[br][bc] = 0
+    
+    # Now do your hole logic on temp_board instead of board
+    return count_holes_on_clean_board(temp_board)
+
+def count_holes_excluding_piece(board, shape, x, y):
+    """
+    Makes a copy of 'board', removes the current piece from that copy,
+    then counts holes in the copy.
+    """
+    # 1) Copy the board so we don't affect the real one
+    temp_board = [row[:] for row in board]
+    
+    # 2) Remove the current (falling) piece from temp_board
+    #    so it doesn't create 'artificial' holes.
+    for i, row_data in enumerate(shape):
+        for j, block in enumerate(row_data):
+            if block:
+                board_r = y + i
+                board_c = x + j
+                if 0 <= board_r < GRID_HEIGHT and 0 <= board_c < GRID_WIDTH:
+                    temp_board[board_r][board_c] = 0
+
+    # 3) Now count holes (top-down or BFS) on temp_board
+    return count_holes_top_down(temp_board)
+
+def count_holes_top_down(clean_board):
+    """
+    Standard top-down hole count:
+    Once we find a block in a column, every subsequent empty cell below it is a hole.
+    """
     holes = 0
     for col in range(GRID_WIDTH):
-        for row in range(1, GRID_HEIGHT):
-            if board[row][col] == 0 and board[row-1][col] != 0:
+        found_block_above = False
+        for row in range(GRID_HEIGHT):  # row=0 is top
+            if clean_board[row][col] != 0:
+                found_block_above = True
+            elif found_block_above and clean_board[row][col] == 0:
                 holes += 1
     return holes
 
-def get_max_height_and_column_heights(board):
-    """Return max column height and array of each column's height."""
+def count_holes_on_clean_board(clean_board):
+    """
+    Standard 'top-down' hole count: 
+    Once we see a block in a column, 
+    every subsequent empty cell below it is a hole.
+    """
+    holes = 0
+    for col in range(GRID_WIDTH):
+        found_block_above = False
+        for row in range(GRID_HEIGHT):  # row=0 is top
+            if clean_board[row][col] != 0:
+                found_block_above = True
+            elif found_block_above and clean_board[row][col] == 0:
+                holes += 1
+    return holes
+    
+def get_max_height_and_aggregate_height(board, current_tetrimino=None, tetrimino_x=0, tetrimino_y=0):
+    """Returns the maximum column height and aggregate height of locked pieces only."""
+    # Create a copy of the board to work with
+    temp_board = [row[:] for row in board]
+    
+    # Remove current tetrimino from height calculation if provided
+    if current_tetrimino and tetrimino_x is not None and tetrimino_y is not None:
+        for i, row in enumerate(current_tetrimino):
+            for j, block in enumerate(row):
+                if block and 0 <= tetrimino_y + i < GRID_HEIGHT and 0 <= tetrimino_x + j < GRID_WIDTH:
+                    temp_board[tetrimino_y + i][tetrimino_x + j] = 0
+
     col_heights = []
     for col in range(GRID_WIDTH):
         h = 0
-        for row in range(GRID_HEIGHT):
-            if board[row][col] != 0:
+        for row in reversed(range(GRID_HEIGHT)):
+            if temp_board[row][col] != 0:
                 h = GRID_HEIGHT - row
                 break
         col_heights.append(h)
-    return max(col_heights) if col_heights else 0, col_heights
-
+        
+    max_height = max(col_heights) if col_heights else 0
+    aggregate_height = sum(col_heights)
+    
+    return max_height, aggregate_height, col_heights
+    
 def get_bumpiness(col_heights):
     """Sum of absolute differences between adjacent columns."""
     bumpiness = 0
     for i in range(len(col_heights)-1):
         bumpiness += abs(col_heights[i] - col_heights[i+1])
     return bumpiness
+
+def detect_wells(col_heights):
+    """Detect useful wells in the column heights."""
+    wells = []
+    for i in range(1, len(col_heights) - 1):
+        if (col_heights[i] + 2 <= col_heights[i-1] and 
+            col_heights[i] + 2 <= col_heights[i+1]):
+            wells.append(i)
+    return wells
 
 # Initialize Pygame
 pygame.init()
@@ -664,8 +567,8 @@ WINDOW_WIDTH = 300
 WINDOW_HEIGHT = 600
 BLOCK_SIZE = 30
 
-GRID_WIDTH = WINDOW_WIDTH // BLOCK_SIZE
-GRID_HEIGHT = WINDOW_HEIGHT // BLOCK_SIZE
+GRID_WIDTH = 10
+GRID_HEIGHT = 20
 
 LEVEL_UP_SCORE = 1000  # Score needed to level up
 MIN_FALL_SPEED = 100   # Minimum fall speed in milliseconds
@@ -832,93 +735,66 @@ def merge_tetrimino(grid, tetrimino, x, y):
         grid.insert(0, [0 for _ in range(GRID_WIDTH)])
         cleared_lines += 1
     
-    # Play sound effects
-    if cleared_lines == 4:
-        #renis_clear_sound.play()
-    elif cleared_lines > 0:
-        #clear_sound.play()
-    
     return cleared_lines
 
-def main_game(agent, base_save_path, save_lock=None, player_actions=False):
+def main_game(agent, base_save_path, save_lock=None, player_actions=False, rewards_list=None):
     """
-    Runs the main game loop where the AI agent plays Tetris.
-    After each game session, it automatically restarts for continuous training.
+    Runs a single game session where the AI agent plays Tetris.
+    After the game ends, the function returns control to the main script.
+    
+    Args:
+        rewards_list (list, optional): If provided, rewards will be appended to this list
     """
-    # Ensure Pygame is initialized in this process
-    pygame.init()
+    print("[DEBUG] Starting a new game session.")
+    logging.debug("Starting a new game session.")
+    
+    # Reset the board/game state
+    grid = [[0 for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
+    next_tetriminos = [generate_tetrimino() for _ in range(3)]
+    current_tetrimino = next_tetriminos.pop(0)
+    next_tetriminos.append(generate_tetrimino())
+    x, y = current_tetrimino['position']
+    tetrimino_shape = current_tetrimino['shape']
+    color = current_tetrimino['color']
+    key = current_tetrimino['key']
 
-    # Load existing training state (if any)
-    optimizer = optim.Adam(agent.gpu_model.parameters())
-    generation = load_training_state(agent, base_save_path, optimizer)
+    # Reset the D action flag for the new block
+    d_action_processed = False
 
-    # Create/render window
-    window = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption("Ezekiel")
+    clock = pygame.time.Clock()
 
-    # Map from key presses to action indices (unused since AI is controlling)
-    key_to_action = {
-        pygame.K_z: 0,      # Rotate clockwise
-        pygame.K_x: 1,      # Rotate counterclockwise
-        pygame.K_LEFT: 2,   # Move left
-        pygame.K_RIGHT: 3,  # Move right
-        pygame.K_DOWN: 4,   # Soft drop
-        pygame.K_SPACE: 5,  # Hard drop
-    }
+    # Basic game parameters
+    level = 1
+    fall_speed = 500  # ms
+    score = 0
+    lock_timer = 0
+    fall_time = 0
+    lines_cleared = 0
+    total_lines_cleared = 0
+    rotations = 0
+    action_count = 0
+    game_over = False
+    hard_drop_executed = False
+    pieces_placed = 0
+    logging.debug(f"Initialized pieces_placed: {pieces_placed}")
 
-    # Valid actions include a "no-op" (index 6)
-    valid_actions = list(key_to_action.values()) + [6]
+    # If initial spawn invalid => immediate game over
+    if not is_valid_move(grid, tetrimino_shape, x, y):
+        print("Game Over: Invalid initial position")
+        logging.warning("Game Over: Invalid initial position")
+        game_over = True
 
-    print(f"\n=== Starting Generation {generation} ===")
-    logging.info(f"=== Starting Generation {generation} ===")
-    print(f"Memory at start of Gen {generation}: {len(agent.memory)} experiences stored.")
-    logging.info(f"Memory at start of Gen {generation}: {len(agent.memory)} experiences stored.")
+    # Construct initial 5-channel state
+    state = construct_state_tensor(
+        grid, score, lines_cleared, pieces_placed, level, agent.device
+    )
 
-    # ----------------------------------------------------------------
-    # Outer loop: Each iteration is ONE entire game. Once the game ends,
-    # we save results, then auto-restart a new game (next generation).
-    # ----------------------------------------------------------------
-    while True:
-        # Reset the board/game state
-        grid = [[0 for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
-        next_tetriminos = [generate_tetrimino() for _ in range(3)]
-        current_tetrimino = next_tetriminos.pop(0)
-        next_tetriminos.append(generate_tetrimino())
-        x, y = current_tetrimino['position']
-        tetrimino_shape = current_tetrimino['shape']
-        color = current_tetrimino['color']
-        key = current_tetrimino['key']
+    print("[DEBUG] Entering the main game loop.")
+    logging.debug("Entering the main game loop.")
 
-        clock = pygame.time.Clock()
-
-        # Basic game parameters
-        level = 1
-        fall_speed = 500  # ms
-        score = 0
-        lock_timer = 0
-        fall_time = 0
-        lines_cleared = 0
-        total_lines_cleared = 0
-        rotations = 0
-        action_count = 0
-        game_over = False
-        hard_drop_executed = False
-        pieces_placed = 0  # Initialize pieces_placed to 0
-        logging.debug(f"Initialized pieces_placed: {pieces_placed}")
-
-        # If initial spawn invalid => immediate game over
-        if not is_valid_move(grid, tetrimino_shape, x, y):
-            print("Game Over: Invalid initial position")
-            logging.warning("Game Over: Invalid initial position")
-            game_over = True
-
-        # Construct initial 5-channel state
-        state = construct_state_tensor(
-            grid, score, lines_cleared, pieces_placed, level, agent.device
-        )
-
-        # --------------- MAIN GAME LOOP ---------------
-        while not game_over:
+    # --------------- MAIN GAME LOOP ---------------
+    while not game_over:
+        try:
             dt = clock.tick(60)
             fall_time += dt
 
@@ -949,7 +825,7 @@ def main_game(agent, base_save_path, save_lock=None, player_actions=False):
                     if is_valid_move(grid, rotated_tetrimino['shape'], x, y):
                         current_tetrimino['shape'] = rotated_tetrimino['shape']
                         rotations += 1
-                        lock_timer = 0
+                        lock_timer = 500
                         logging.debug(f"Action {action}: Rotated CW. Rotations: {rotations}")
                 elif action == 1:  # Rotate CCW
                     rotated_tetrimino = copy.deepcopy(current_tetrimino)
@@ -957,20 +833,20 @@ def main_game(agent, base_save_path, save_lock=None, player_actions=False):
                     if is_valid_move(grid, rotated_tetrimino['shape'], x, y):
                         current_tetrimino['shape'] = rotated_tetrimino['shape']
                         rotations += 1
-                        lock_timer = 0
+                        lock_timer = 500
                         logging.debug(f"Action {action}: Rotated CCW. Rotations: {rotations}")
                 elif action == 2:  # Left
                     if is_valid_move(grid, current_tetrimino['shape'], x - 1, y):
                         current_tetrimino['position'] = (x - 1, y)
                         x -= 1
-                        lock_timer = 0
+                        lock_timer = 500
                         moved_horizontally = True
                         logging.debug(f"Action {action}: Moved Left to position ({x}, {y})")
                 elif action == 3:  # Right
                     if is_valid_move(grid, current_tetrimino['shape'], x + 1, y):
                         current_tetrimino['position'] = (x + 1, y)
                         x += 1
-                        lock_timer = 0
+                        lock_timer = 500
                         moved_horizontally = True
                         logging.debug(f"Action {action}: Moved Right to position ({x}, {y})")
                 elif action == 4:  # Soft drop
@@ -978,21 +854,12 @@ def main_game(agent, base_save_path, save_lock=None, player_actions=False):
                         current_tetrimino['position'] = (x, y + 1)
                         y += 1
                         fall_time = 0
-                        lock_timer = 0
+                        lock_timer = 500
                         moved_down = True
                         logging.debug(f"Action {action}: Soft Dropped to position ({x}, {y})")
-                elif action == 5:  # Hard drop
-                    try:
-                        y = hard_drop(current_tetrimino, x, y, grid)
-                        locked = True
-                        lock_timer = 500  # Start lock timer
-                        hard_drop_executed = True
-                        logging.debug(f"Action {action}: Hard Dropped to position ({x}, {y})")
-                    except Exception as e:
-                        print(f"Error during hard drop: {e}")
-                        logging.error(f"Error during hard drop: {e}", exc_info=True)
-                        pygame.quit()
-                        sys.exit()
+                    else:
+                        lock_timer += 500
+                        logging.debug(f"Action {action}: Soft drop attempted but cannot move down. Initiating lock.")
 
             # 3) Handle locking vs gravity
             if hard_drop_executed or not is_valid_move(grid, current_tetrimino['shape'], x, y + 1):
@@ -1002,7 +869,7 @@ def main_game(agent, base_save_path, save_lock=None, player_actions=False):
                         lines_cleared = merge_tetrimino(grid, current_tetrimino, x, y)
                         total_lines_cleared += lines_cleared
                         score += SCORING_RULES.get(lines_cleared, lines_cleared * SCORE_INCREMENT)
-                        pieces_placed += 1  # Increment pieces_placed by 1
+                        pieces_placed += 1
                         logging.debug(f"Placed piece #{pieces_placed}. Lines cleared: {lines_cleared}, Total lines: {total_lines_cleared}, Score: {score}")
 
                         if score >= level * LEVEL_UP_SCORE:
@@ -1018,6 +885,9 @@ def main_game(agent, base_save_path, save_lock=None, player_actions=False):
                         color = current_tetrimino['color']
                         key = current_tetrimino['key']
 
+                        # Reset the D action flag for the new block
+                        d_action_processed = False
+
                         # Check for game over
                         if not is_valid_move(grid, tetrimino_shape, x, y):
                             game_over = True
@@ -1026,6 +896,9 @@ def main_game(agent, base_save_path, save_lock=None, player_actions=False):
                         hard_drop_executed = False
                         lock_timer = 0
                         rotations = 0
+                        
+                        locked = True
+                        
                     except Exception as e:
                         print(f"Error during locking: {e}")
                         logging.error(f"Error during locking: {e}", exc_info=True)
@@ -1068,13 +941,16 @@ def main_game(agent, base_save_path, save_lock=None, player_actions=False):
                     device=agent.device
                 )
                 next_state = next_state.to(agent.device)
+                
+                if rewards_list is not None:
+                    rewards_list.append(reward)
+                    
             except Exception as e:
                 print(f"Error getting reward and next state: {e}")
                 logging.error(f"Error getting reward and next state: {e}", exc_info=True)
                 pygame.quit()
                 sys.exit()
 
-            # Debugging: Ensure next_state is a tensor
             if not isinstance(next_state, torch.Tensor):
                 logging.error(f"Next state is not a torch.Tensor: {type(next_state)}")
                 raise TypeError(f"Next state is not a torch.Tensor: {type(next_state)}")
@@ -1112,138 +988,216 @@ def main_game(agent, base_save_path, save_lock=None, player_actions=False):
             if action_count % 50 == 0:
                 print(f"Action {action_count} | Score={score} | Reward={reward} | Lines={total_lines_cleared}")
                 logging.info(f"Action {action_count} | Score={score} | Reward={reward} | Lines={total_lines_cleared}")
-
-        # -------------- GAME OVER --------------
-        print(f"Game Over - Score {score}, Lines Cleared {total_lines_cleared}, Pieces Placed {pieces_placed}")
-        logging.info(f"Game Over - Score {score}, Lines Cleared {total_lines_cleared}, Pieces Placed {pieces_placed}")
-
-        # Save training state
-        try:
-            if save_lock:
-                save_training_state(agent, optimizer, generation, base_save_path, save_lock, force_save=True)
-            else:
-                save_training_state(agent, optimizer, generation, base_save_path, force_save=True)
         except Exception as e:
-            print(f"Error saving training state: {e}")
-            logging.error(f"Error saving training state: {e}", exc_info=True)
+            print(f"Error: {e}")
+    print("[DEBUG] Game session ended. Exiting main_game.")
+    logging.debug("Game session ended. Exiting main_game.")
+    
+def find_latest_valid_checkpoint(checkpoint_dir):
+    """
+    Finds and returns the path to the latest valid checkpoint.
 
-        # snapshot every 10 generations
-        if generation % 10 == 0:
-            try:
-                gen_ckpt = f"{base_save_path.split('.pth')[0]}_gen{generation}.pth"
-                save_training_state(agent, optimizer, generation, gen_ckpt, save_lock)
-                print(f"Snapshot saved at {gen_ckpt}")
-                logging.info(f"Snapshot saved at {gen_ckpt}")
-            except Exception as e:
-                print(f"Error saving snapshot: {e}")
-                logging.error(f"Error saving snapshot: {e}", exc_info=True)
-
-        # Auto-restart next generation
-        generation += 1
-        agent.decay_epsilon()  # Decay epsilon after each generation
-        print(f"=== Auto-restarting for Generation {generation} ===\n")
-        logging.info(f"=== Auto-restarting for Generation {generation} ===\n")
-
-def find_latest_valid_checkpoint(base_save_path):
-    checkpoint_dir = os.path.dirname(base_save_path)
-    if checkpoint_dir == "":
-        checkpoint_dir = "."
-
-    checkpoint_pattern = re.compile(r'_gen(\d+)\.pth$')
+    Returns:
+    - tuple: (generation_number, checkpoint_path)
+    - None: If no valid checkpoints are found.
+    """
+    checkpoint_pattern = re.compile(r'trained_bfs_model_gen(\d+)\.pth$')
     checkpoints = []
+
+    # If directory doesn't exist or is invalid:
+    if not os.path.isdir(checkpoint_dir):
+        print(f"[DEBUG] Checkpoint directory does not exist or is not a directory: {checkpoint_dir}")
+        logging.warning(f"Checkpoint directory does not exist or is not a directory: {checkpoint_dir}")
+        return None
+
+    try:
+        for filename in os.listdir(checkpoint_dir):
+            match = checkpoint_pattern.match(filename)
+            if match:
+                generation = int(match.group(1))
+                checkpoint_path = os.path.join(checkpoint_dir, filename)
+                if check_checkpoint_integrity(checkpoint_path):
+                    checkpoints.append((generation, checkpoint_path))
+    except Exception as e:
+        print(f"[DEBUG] Error accessing checkpoint directory {checkpoint_dir}: {e}")
+        logging.error(f"Error accessing checkpoint directory {checkpoint_dir}: {e}", exc_info=True)
+        return None
+
+    if not checkpoints:
+        print("[DEBUG] No valid checkpoints found.")
+        logging.info("No valid checkpoints found.")
+        return None
+
+    # Sort by generation descending
+    checkpoints.sort(key=lambda x: x[0], reverse=True)
+    latest_generation, latest_checkpoint = checkpoints[0]
+    print(f"[DEBUG] Latest checkpoint: Generation {latest_generation}, Path: {latest_checkpoint}")
+    logging.info(f"Latest checkpoint: Generation {latest_generation}, Path: {latest_checkpoint}")
+
+    # Return a 2-element tuple for easy unpacking
+    return (latest_generation, latest_checkpoint)
+    
+def check_checkpoint_integrity(checkpoint_path):
+    """
+    Checks whether the checkpoint file contains all required keys.
+    Returns True if valid, False otherwise.
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"[DEBUG] Checkpoint file {checkpoint_path} does not exist.")
+        logging.warning(f"Checkpoint file {checkpoint_path} does not exist.")
+        return False
+
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    except Exception as e:
+        print(f"[DEBUG] Failed to load checkpoint {checkpoint_path}: {e}")
+        logging.error(f"Failed to load checkpoint {checkpoint_path}: {e}", exc_info=True)
+        return False
+
+    required_keys = ['model_state_dict', 'optimizer_state_dict', 'generation', 'memory']
+    missing_keys = [key for key in required_keys if key not in checkpoint]
+
+    if missing_keys:
+        print(f"[DEBUG] Checkpoint {checkpoint_path} is missing required keys: {missing_keys}")
+        logging.warning(f"Checkpoint {checkpoint_path} is missing required keys: {missing_keys}")
+        return False
+
+    print(f"[DEBUG] Checkpoint {checkpoint_path} is valid with generation {checkpoint['generation']}.")
+    logging.info(f"Checkpoint {checkpoint_path} is valid with generation {checkpoint['generation']}.")
+    return True
+    
+def cleanup_old_checkpoints(directory, pattern, keep=10):
+    try:
+        checkpoints = sorted(glob.glob(os.path.join(directory, pattern)), key=os.path.getmtime, reverse=True)
+        for ckpt in checkpoints[keep:]:
+            try:
+                os.remove(ckpt)
+                logging.info(f"Removed old checkpoint: {ckpt}")
+                print(f"[DEBUG] Removed old checkpoint: {ckpt}")
+            except Exception as e:
+                logging.error(f"Failed to remove old checkpoint {ckpt}: {e}")
+                print(f"[DEBUG] Failed to remove old checkpoint {ckpt}: {e}")
+    except Exception as e:
+        print(f"[DEBUG] Error during cleanup of checkpoints: {e}")
+        logging.error(f"Error during cleanup of checkpoints: {e}", exc_info=True)
+        
+def get_latest_checkpoint_path(checkpoint_dir):
+    """
+    Retrieves the path of the latest checkpoint in the given directory.
+    
+    Parameters:
+    - checkpoint_dir (str): Directory where checkpoints are stored.
+    
+    Returns:
+    - tuple: (generation_number, checkpoint_path)
+    - None: If no checkpoints are found.
+    """
+    checkpoint_pattern = re.compile(r'trained_bfs_model_gen(\d+)\.pth$')
+    checkpoints = []
+    
+    if not os.path.exists(checkpoint_dir):
+        print(f"[DEBUG] Checkpoint directory does not exist: {checkpoint_dir}")
+        logging.warning(f"Checkpoint directory does not exist: {checkpoint_dir}")
+        return None
     
     for filename in os.listdir(checkpoint_dir):
         match = checkpoint_pattern.search(filename)
         if match:
             generation = int(match.group(1))
             checkpoint_path = os.path.join(checkpoint_dir, filename)
-            result = check_checkpoint_integrity(checkpoint_path)
-            if result:
-                checkpoints.append(result)
+            if check_checkpoint_integrity(checkpoint_path):
+                checkpoints.append((generation, checkpoint_path))
     
     if checkpoints:
+        # Sort checkpoints by generation number in descending order
         checkpoints.sort(key=lambda x: x[0], reverse=True)
         latest_generation, latest_checkpoint = checkpoints[0]
-        print(f"Loading the latest valid checkpoint from generation {latest_generation}: {latest_checkpoint}")
-        logging.info(f"Loading the latest valid checkpoint from generation {latest_generation}: {latest_checkpoint}")
+        print(f"[DEBUG] Latest checkpoint: Generation {latest_generation}, Path: {latest_checkpoint}")
+        logging.info(f"Latest checkpoint: Generation {latest_generation}, Path: {latest_checkpoint}")
         return latest_checkpoint
     else:
-        print("No valid checkpoints found. Starting from scratch.")
-        logging.info("No valid checkpoints found. Starting from scratch.")
+        print("[DEBUG] No valid checkpoints found.")
+        logging.info("No valid checkpoints found.")
         return None
 
-def check_checkpoint_integrity(checkpoint_path):
-    if os.path.exists(checkpoint_path):
-        try:
-            checkpoint = torch.load(checkpoint_path)
-            required_keys = ['model_state_dict', 'optimizer_state_dict', 'generation', 'memory']
-            if all(key in checkpoint for key in required_keys):
-                print(f"Checkpoint {checkpoint_path} is valid with generation {checkpoint['generation']}.")
-                logging.info(f"Checkpoint {checkpoint_path} is valid with generation {checkpoint['generation']}.")
-                return checkpoint['generation'], checkpoint_path
-            else:
-                print(f"Checkpoint {checkpoint_path} is missing required keys.")
-                logging.warning(f"Checkpoint {checkpoint_path} is missing required keys.")
-                return None
-        except Exception as e:
-            print(f"Failed to load checkpoint {checkpoint_path}: {e}")
-            logging.error(f"Failed to load checkpoint {checkpoint_path}: {e}", exc_info=True)
-            return None
-    else:
-        print(f"Checkpoint {checkpoint_path} does not exist.")
-        logging.warning(f"Checkpoint {checkpoint_path} does not exist.")
-        return None
+def plot_rewards(rewards, generation, save_dir):
+    """Plot and save rewards trend."""
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(10, 6))
+    plt.plot(rewards)
+    plt.title(f'Rewards Over Time (Up to Generation {generation})')
+    plt.xlabel('Episodes')
+    plt.ylabel('Reward')
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, f'rewards_gen_{generation}.png'))
+    plt.close()
 
-if __name__ == "__main__":
-
+def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Initialize agent with correct parameters
     agent = TetrisAgent(input_height=20, input_width=10, action_size=6, sync_frequency=4)
     agent.device = device
     agent.gpu_model.to(device)
+    
+    checkpoint_dir = os.path.abspath("checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Initialize rewards list
+    all_rewards = []
 
-    # Define checkpoint path
-    base_save_path = "trained_bfs_model.pth"
-
-    # Attempt to load the latest valid checkpoint
-    latest_checkpoint = find_latest_valid_checkpoint(base_save_path)
-    if latest_checkpoint:
+    # Find the latest valid checkpoint
+    checkpoint_info = find_latest_valid_checkpoint(checkpoint_dir)
+    if checkpoint_info:
+        generation_number, checkpoint_path = checkpoint_info
         try:
-            # Re-initialize optimizer to match loaded state
-            optimizer = optim.Adam(agent.gpu_model.parameters())
-            generation = load_training_state(agent, latest_checkpoint[1], optimizer)
+            generation = load_training_state(agent, checkpoint_path)
+            print(f"[DEBUG] Loaded checkpoint from generation {generation}")
         except Exception as e:
             print(f"Error loading training state: {e}")
             logging.error(f"Error loading training state: {e}", exc_info=True)
             generation = 0
+            agent.optimizer = optim.Adam(agent.gpu_model.parameters())
     else:
-        generation = 0  # Start from scratch if no checkpoint is found
-        optimizer = optim.Adam(agent.gpu_model.parameters())  # Initialize optimizer
+        generation = 0
+        agent.optimizer = optim.Adam(agent.gpu_model.parameters())
+        print("[DEBUG] No checkpoint found. Starting from scratch.")
 
-    # Run supervised BFS training if needed
-    supervised_train_from_bfs(
-     agent,
-     bfs_data_path="training_data.pkl",  # Path to your BFS-collected data
-     epochs=5,
-     batch_size=32
-    )
-
-    # Start the main game loop with continuous training
-    try:
-        main_game(agent, base_save_path)
-    except Exception as e:
-        print(f"An error occurred during the game loop: {e}")
-        traceback.print_exc()  # Print full traceback
-        logging.error(f"An error occurred during the game loop: {e}", exc_info=True)
-        pygame.quit()
-        sys.exit()
-
-    # After game over, save the model
-    try:
-        agent.save_model(base_save_path)
-        print(f"Model parameters saved to {base_save_path}")
-        logging.info(f"Model parameters saved to {base_save_path}")
-    except Exception as e:
-        print(f"Error saving model after gameplay: {e}")
-        logging.error(f"Error saving model after gameplay: {e}", exc_info=True)
+    TOTAL_GENERATIONS = 2000
+    for gen in range(generation + 1, TOTAL_GENERATIONS + 1):
+        print(f"\n=== Starting Generation {gen} ===")
+        logging.info(f"=== Starting Generation {gen} ===")
+        
+        # Run game and collect rewards
+        try:
+            episode_rewards = []
+            main_game(agent, checkpoint_dir, rewards_list=episode_rewards)
+            all_rewards.extend(episode_rewards)
+        except Exception as e:
+            print(f"[DEBUG] An error occurred during the game loop: {e}")
+            traceback.print_exc()
+            logging.error(f"An error occurred during the game loop: {e}", exc_info=True)
+            pygame.quit()
+            sys.exit()
+        
+        # Save model and plot rewards every 10 generations
+        if gen % 10 == 0:
+            try:
+                # Save model
+                new_generation = gen
+                model_save_path = os.path.join(checkpoint_dir, f"trained_bfs_model_gen{new_generation}.pth")
+                agent.save_model(model_save_path, new_generation)
+                
+                # Plot rewards
+                plot_rewards(all_rewards, new_generation, os.path.dirname(model_save_path))
+                
+                print(f"[DEBUG] Model and rewards plot saved at generation {new_generation}")
+                logging.info(f"Model and rewards plot saved at generation {new_generation}")
+                
+            except Exception as e:
+                print(f"[DEBUG] Error saving model or plotting rewards: {e}")
+                logging.error(f"Error saving model or plotting rewards: {e}", exc_info=True)
+        
+        # Cleanup old checkpoints
+        cleanup_old_checkpoints(checkpoint_dir, 'trained_bfs_model_gen*.pth', keep=10)
+        
+if __name__ == "__main__":
+    main()
