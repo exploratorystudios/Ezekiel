@@ -1,5 +1,3 @@
-# tetris_agent.py
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -129,22 +127,49 @@ class TetrisAgent:
             self.epsilon = max(self.epsilon, self.epsilon_min)
             logging.debug(f"Decayed epsilon to {self.epsilon}")
     
-    def save_model(self, path):
-        """Save the model's state dictionary."""
+    def save_model(self, path, generation):
+        """Save the model's state, optimizer state, generation, and memory."""
         try:
-            torch.save(self.gpu_model.state_dict(), path)
-            logging.info(f"Model saved to {path}")
+            checkpoint = {
+                'model_state_dict': self.gpu_model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'generation': generation,
+                'memory': list(self.memory)  # Convert deque to list for serialization
+            }
+            torch.save(checkpoint, path)
+            logging.info(f"Full checkpoint saved to {path} at generation {generation}")
+            print(f"[DEBUG] Full checkpoint saved to {path} at generation {generation}")
         except Exception as e:
-            logging.error(f"Failed to save model to {path}: {e}")
+            logging.error(f"Failed to save checkpoint to {path}: {e}")
+            print(f"[DEBUG] Failed to save checkpoint to {path}: {e}")
     
-    def load_model(self, path):
-        """Load the model's state dictionary."""
+    def load_model(self, path, device):
+        """Load the full checkpoint including model, optimizer, generation, and memory."""
         if os.path.exists(path):
             try:
-                self.gpu_model.load_state_dict(torch.load(path, map_location=self.device))
-                self.gpu_model.eval()
-                logging.info(f"Model loaded from {path}")
+                # Remove weights_only=True to load the full checkpoint
+                checkpoint = torch.load(path, map_location=device)
+                required_keys = ['model_state_dict', 'optimizer_state_dict', 'generation', 'memory']
+                if all(key in checkpoint for key in required_keys):
+                    self.gpu_model.load_state_dict(checkpoint['model_state_dict'])
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    self.memory = deque(checkpoint['memory'], maxlen=2000)
+                    generation = checkpoint['generation']
+                    self.gpu_model.to(device)
+                    self.gpu_model.eval()
+                    logging.info(f"Full checkpoint loaded from {path} at generation {generation}")
+                    print(f"[DEBUG] Full checkpoint loaded from {path} at generation {generation}")
+                    return generation
+                else:
+                    missing = [key for key in required_keys if key not in checkpoint]
+                    logging.warning(f"Checkpoint {path} missing keys: {missing}")
+                    print(f"[DEBUG] Checkpoint {path} missing keys: {missing}")
+                    return 0
             except Exception as e:
-                logging.error(f"Failed to load model from {path}: {e}")
+                logging.error(f"Failed to load checkpoint from {path}: {e}")
+                print(f"[DEBUG] Failed to load checkpoint from {path}: {e}")
+                return 0
         else:
-            logging.error(f"Model file {path} not found.")
+            logging.error(f"Checkpoint file {path} does not exist.")
+            print(f"[DEBUG] Checkpoint file {path} does not exist.")
+            return 0
